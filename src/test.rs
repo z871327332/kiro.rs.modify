@@ -66,7 +66,10 @@ pub(crate) async fn call_stream_api() -> anyhow::Result<()> {
                 total_bytes += chunk.len();
 
                 // 将数据喂给解码器
-                decoder.feed(&chunk);
+                if let Err(e) = decoder.feed(&chunk) {
+                    eprintln!("[缓冲区错误] {}", e);
+                    continue;
+                }
 
                 // 解码所有可用的帧
                 for result in decoder.decode_iter() {

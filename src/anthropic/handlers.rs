@@ -83,7 +83,6 @@ pub async fn post_messages(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
-
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -246,7 +245,9 @@ fn create_sse_stream(
                     match chunk_result {
                         Some(Ok(chunk)) => {
                             // 解码事件
-                            decoder.feed(&chunk);
+                            if let Err(e) = decoder.feed(&chunk) {
+                                tracing::warn!("缓冲区溢出: {}", e);
+                            }
 
                             let mut events = Vec::new();
                             for result in decoder.decode_iter() {
@@ -353,7 +354,9 @@ async fn handle_non_stream_request(
 
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
-    decoder.feed(&body_bytes);
+    if let Err(e) = decoder.feed(&body_bytes) {
+        tracing::warn!("缓冲区溢出: {}", e);
+    }
 
     let mut text_content = String::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
