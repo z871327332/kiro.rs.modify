@@ -498,6 +498,7 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
 
     tools
         .iter()
+        .filter(|t| !t.is_web_search() && t.name != "web_search")
         .map(|t| {
             let mut description = t.description.clone();
 
@@ -538,14 +539,10 @@ fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
                 t.budget_tokens
             ));
         } else if t.thinking_type == "adaptive" {
-            let effort = req
-                .output_config
-                .as_ref()
-                .map(|c| c.effort.as_str())
-                .unwrap_or("high");
+            // Kiro 后端不支持 adaptive 模式，转换为 enabled 模式
             return Some(format!(
-                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
-                effort
+                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
+                t.budget_tokens
             ));
         }
     }
@@ -722,6 +719,35 @@ fn convert_assistant_message(
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 tool_uses.push(ToolUseEntry::new(id, name).with_input(input));
+                            }
+                        }
+                        // WebSearch 相关类型：server_tool_use 忽略，web_search_tool_result 提取为文本
+                        "server_tool_use" => {}
+                        "web_search_tool_result" => {
+                            // 将搜索结果提取为文本，保留在对话历史中
+                            if let Some(content) = item.get("content") {
+                                if let Some(arr) = content.as_array() {
+                                    for result in arr {
+                                        if result.get("type").and_then(|t| t.as_str())
+                                            == Some("web_search_result")
+                                        {
+                                            let title = result
+                                                .get("title")
+                                                .and_then(|t| t.as_str())
+                                                .unwrap_or("");
+                                            let url = result
+                                                .get("url")
+                                                .and_then(|u| u.as_str())
+                                                .unwrap_or("");
+                                            if !title.is_empty() || !url.is_empty() {
+                                                text_content.push_str(&format!(
+                                                    "[{}]({})\n",
+                                                    title, url
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         _ => {}

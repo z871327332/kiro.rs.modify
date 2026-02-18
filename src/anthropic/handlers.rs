@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::stream::{SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
 
@@ -166,17 +166,26 @@ pub async fn post_messages(
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
+        // 尝试提取搜索查询，判断是否为纯搜索请求
+        if let Some(_query) = websearch::extract_search_query(&payload) {
+            tracing::debug!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
+            // 估算输入 tokens
+            let input_tokens = token::count_all_tokens(
+                payload.model.clone(),
+                payload.system.clone(),
+                payload.messages.clone(),
+                payload.tools.clone(),
+            ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+            return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        } else {
+            tracing::debug!("包含 WebSearch 工具但非搜索请求，过滤后走普通对话路径");
+            // 过滤掉 web_search 工具，避免传给 Kiro 后端
+            payload.tools = payload.tools.map(|tools| {
+                tools.into_iter().filter(|t| !t.is_web_search() && t.name != "web_search").collect()
+            });
+        }
     }
 
     // 转换请求
@@ -630,9 +639,8 @@ pub async fn count_tokens(
 
 /// POST /cc/v1/messages
 ///
-/// Claude Code 兼容端点，与 /v1/messages 的区别在于：
-/// - 流式响应会等待 kiro 端返回 contextUsageEvent 后再发送 message_start
-/// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
+/// Claude Code 兼容端点，使用实时流式转发。
+/// message_start 中使用估算的 input_tokens，message_delta 中携带从 contextUsageEvent 计算的准确值。
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
@@ -666,17 +674,26 @@ pub async fn post_messages_cc(
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
+        // 尝试提取搜索查询，判断是否为纯搜索请求
+        if let Some(_query) = websearch::extract_search_query(&payload) {
+            tracing::debug!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
+            // 估算输入 tokens
+            let input_tokens = token::count_all_tokens(
+                payload.model.clone(),
+                payload.system.clone(),
+                payload.messages.clone(),
+                payload.tools.clone(),
+            ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+            return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        } else {
+            tracing::debug!("包含 WebSearch 工具但非搜索请求，过滤后走普通对话路径");
+            // 过滤掉 web_search 工具，避免传给 Kiro 后端
+            payload.tools = payload.tools.map(|tools| {
+                tools.into_iter().filter(|t| !t.is_web_search() && t.name != "web_search").collect()
+            });
+        }
     }
 
     // 转换请求
@@ -739,8 +756,8 @@ pub async fn post_messages_cc(
         .unwrap_or(false);
 
     if payload.stream {
-        // 流式响应（缓冲模式）
-        handle_stream_request_buffered(
+        // 流式响应（实时转发，message_delta 中携带准确的 input_tokens）
+        handle_stream_request(
             provider,
             &request_body,
             &payload.model,
@@ -754,136 +771,4 @@ pub async fn post_messages_cc(
     }
 }
 
-/// 处理流式请求（缓冲版本）
-///
-/// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
-/// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
-async fn handle_stream_request_buffered(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    request_body: &str,
-    model: &str,
-    estimated_input_tokens: i32,
-    thinking_enabled: bool,
-) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::error!("Kiro API 调用失败: {}", e);
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    format!("上游 API 调用失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
 
-    // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled);
-
-    // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
-
-    // 返回 SSE 响应
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
-}
-
-/// 创建缓冲 SSE 事件流
-///
-/// 工作流程：
-/// 1. 等待上游流完成，期间只发送 ping 保活信号
-/// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
-/// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
-/// 4. 一次性发送所有事件
-fn create_buffered_sse_stream(
-    response: reqwest::Response,
-    ctx: BufferedStreamContext,
-) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let body_stream = response.bytes_stream();
-
-    stream::unfold(
-        (
-            body_stream,
-            ctx,
-            EventStreamDecoder::new(),
-            false,
-            interval(Duration::from_secs(PING_INTERVAL_SECS)),
-        ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
-            if finished {
-                return None;
-            }
-
-            loop {
-                tokio::select! {
-                    // 使用 biased 模式，优先检查 ping 定时器
-                    // 避免在上游 chunk 密集时 ping 被"饿死"
-                    biased;
-
-                    // 优先检查 ping 保活（等待期间唯一发送的数据）
-                    _ = ping_interval.tick() => {
-                        tracing::trace!("发送 ping 保活事件（缓冲模式）");
-                        let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
-                    }
-
-                    // 然后处理数据流
-                    chunk_result = body_stream.next() => {
-                        match chunk_result {
-                            Some(Ok(chunk)) => {
-                                // 解码事件
-                                if let Err(e) = decoder.feed(&chunk) {
-                                    tracing::warn!("缓冲区溢出: {}", e);
-                                }
-
-                                for result in decoder.decode_iter() {
-                                    match result {
-                                        Ok(frame) => {
-                                            if let Ok(event) = Event::from_frame(frame) {
-                                                // 缓冲事件（复用 StreamContext 的处理逻辑）
-                                                ctx.process_and_buffer(&event);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("解码事件失败: {}", e);
-                                        }
-                                    }
-                                }
-                                // 继续读取下一个 chunk，不发送任何数据
-                            }
-                            Some(Err(e)) => {
-                                tracing::error!("读取响应流失败: {}", e);
-                                // 发生错误，完成处理并返回所有事件
-                                let all_events = ctx.finish_and_get_all_events();
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
-                            }
-                            None => {
-                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）
-                                let all_events = ctx.finish_and_get_all_events();
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
-                            }
-                        }
-                    }
-                }
-            }
-        },
-    )
-    .flatten()
-}

@@ -730,16 +730,9 @@ impl StreamContext {
                     self.in_thinking_block = false;
                     self.thinking_extracted = true;
 
-                    // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
+                    // 发送关闭 thinking block 的事件序列
                     if let Some(thinking_index) = self.thinking_block_index {
-                        // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // 再发送 content_block_stop
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
-                        }
+                        events.extend(self.close_thinking_block(thinking_index));
                     }
 
                     // 剥离 `</thinking>\n\n`（find_real_thinking_end_tag 已确认 \n\n 存在）
@@ -859,6 +852,48 @@ impl StreamContext {
         )
     }
 
+    /// 创建 signature_delta 事件
+    ///
+    /// Anthropic API 要求 thinking block 关闭前发送 signature_delta，
+    /// Claude Code 依赖此事件来确认 thinking block 的有效性。
+    fn create_signature_delta_event(&self, index: i32) -> SseEvent {
+        use sha2::{Digest, Sha256};
+        // 生成伪签名：基于 message_id + index 的 SHA256 哈希
+        let mut hasher = Sha256::new();
+        hasher.update(self.message_id.as_bytes());
+        hasher.update(index.to_le_bytes());
+        hasher.update(self.output_tokens.to_le_bytes());
+        let hash = hasher.finalize();
+        let signature = hex::encode(hash);
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": signature
+                }
+            }),
+        )
+    }
+
+    /// 关闭 thinking block 的统一方法
+    ///
+    /// 按 Anthropic API 规范发送：空 thinking_delta → signature_delta → content_block_stop
+    fn close_thinking_block(&mut self, thinking_index: i32) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        // 空的 thinking_delta
+        events.push(self.create_thinking_delta_event(thinking_index, ""));
+        // signature_delta（Claude Code 依赖此事件）
+        events.push(self.create_signature_delta_event(thinking_index));
+        // content_block_stop
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
+            events.push(stop_event);
+        }
+        events
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -888,14 +923,7 @@ impl StreamContext {
                 self.thinking_extracted = true;
 
                 if let Some(thinking_index) = self.thinking_block_index {
-                    // 先发送空的 thinking_delta
-                    events.push(self.create_thinking_delta_event(thinking_index, ""));
-                    // 再发送 content_block_stop
-                    if let Some(stop_event) =
-                        self.state_manager.handle_content_block_stop(thinking_index)
-                    {
-                        events.push(stop_event);
-                    }
+                    events.extend(self.close_thinking_block(thinking_index));
                 }
 
                 // 把结束标签后的内容当作普通文本（通常为空或空白）
@@ -996,14 +1024,9 @@ impl StreamContext {
                         }
                     }
 
-                    // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
+                    // 关闭 thinking 块
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
-                        }
+                        events.extend(self.close_thinking_block(thinking_index));
                     }
 
                     // 把结束标签后的内容当作普通文本（通常为空或空白）
@@ -1022,16 +1045,9 @@ impl StreamContext {
                             self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
                         );
                     }
-                    // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
+                    // 关闭 thinking 块
                     if let Some(thinking_index) = self.thinking_block_index {
-                        // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // 再发送 content_block_stop
-                        if let Some(stop_event) =
-                            self.state_manager.handle_content_block_stop(thinking_index)
-                        {
-                            events.push(stop_event);
-                        }
+                        events.extend(self.close_thinking_block(thinking_index));
                     }
                 }
             } else {
@@ -1062,99 +1078,6 @@ impl StreamContext {
                 .generate_final_events(final_input_tokens, self.output_tokens),
         );
         events
-    }
-}
-
-/// 缓冲流处理上下文 - 用于 /cc/v1/messages 流式请求
-///
-/// 与 `StreamContext` 不同，此上下文会缓冲所有事件直到流结束，
-/// 然后用从 `contextUsageEvent` 计算的正确 `input_tokens` 更正 `message_start` 事件。
-///
-/// 工作流程：
-/// 1. 使用 `StreamContext` 正常处理所有 Kiro 事件
-/// 2. 把生成的 SSE 事件缓存起来（而不是立即发送）
-/// 3. 流结束时，找到 `message_start` 事件并更新其 `input_tokens`
-/// 4. 一次性返回所有事件
-pub struct BufferedStreamContext {
-    /// 内部流处理上下文（复用现有的事件处理逻辑）
-    inner: StreamContext,
-    /// 缓冲的所有事件（包括 message_start、content_block_start 等）
-    event_buffer: Vec<SseEvent>,
-    /// 估算的 input_tokens（用于回退）
-    estimated_input_tokens: i32,
-    /// 是否已经生成了初始事件
-    initial_events_generated: bool,
-}
-
-impl BufferedStreamContext {
-    /// 创建缓冲流上下文
-    pub fn new(
-        model: impl Into<String>,
-        estimated_input_tokens: i32,
-        thinking_enabled: bool,
-    ) -> Self {
-        let inner =
-            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled);
-        Self {
-            inner,
-            event_buffer: Vec::new(),
-            estimated_input_tokens,
-            initial_events_generated: false,
-        }
-    }
-
-    /// 处理 Kiro 事件并缓冲结果
-    ///
-    /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
-    pub fn process_and_buffer(&mut self, event: &crate::kiro::model::events::Event) {
-        // 首次处理事件时，先生成初始事件（message_start 等）
-        if !self.initial_events_generated {
-            let initial_events = self.inner.generate_initial_events();
-            self.event_buffer.extend(initial_events);
-            self.initial_events_generated = true;
-        }
-
-        // 处理事件并缓冲结果
-        let events = self.inner.process_kiro_event(event);
-        self.event_buffer.extend(events);
-    }
-
-    /// 完成流处理并返回所有事件
-    ///
-    /// 此方法会：
-    /// 1. 生成最终事件（message_delta, message_stop）
-    /// 2. 用正确的 input_tokens 更正 message_start 事件
-    /// 3. 返回所有缓冲的事件
-    pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
-        // 如果从未处理过事件，也要生成初始事件
-        if !self.initial_events_generated {
-            let initial_events = self.inner.generate_initial_events();
-            self.event_buffer.extend(initial_events);
-            self.initial_events_generated = true;
-        }
-
-        // 生成最终事件
-        let final_events = self.inner.generate_final_events();
-        self.event_buffer.extend(final_events);
-
-        // 获取正确的 input_tokens
-        let final_input_tokens = self
-            .inner
-            .context_input_tokens
-            .unwrap_or(self.estimated_input_tokens);
-
-        // 更正 message_start 事件中的 input_tokens
-        for event in &mut self.event_buffer {
-            if event.event == "message_start" {
-                if let Some(message) = event.data.get_mut("message") {
-                    if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
-                    }
-                }
-            }
-        }
-
-        std::mem::take(&mut self.event_buffer)
     }
 }
 

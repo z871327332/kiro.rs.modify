@@ -98,13 +98,13 @@ pub struct WebSearchResult {
     pub public_domain: Option<bool>,
 }
 
-/// 检查请求是否为纯 WebSearch 请求
+/// 检查请求是否包含 WebSearch 工具
 ///
-/// 条件：tools 有且只有一个，且 name 为 web_search
+/// 条件：tools 中存在 web_search 工具（基于 tool_type 或 name 双重判断）
 pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
-    req.tools.as_ref().is_some_and(|tools| {
-        tools.len() == 1 && tools.first().is_some_and(|t| t.name == "web_search")
-    })
+    req.tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|t| t.is_web_search() || t.name == "web_search"))
 }
 
 /// 从消息中提取搜索查询
@@ -242,6 +242,7 @@ fn generate_websearch_events(
     );
 
     // 1. message_start
+    let search_count = search_results.as_ref().map(|r| if r.results.is_empty() { 0 } else { 1 }).unwrap_or(0);
     events.push(SseEvent::new(
         "message_start",
         json!({
@@ -258,7 +259,10 @@ fn generate_websearch_events(
                     "input_tokens": input_tokens,
                     "output_tokens": 0,
                     "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_read_input_tokens": 0,
+                    "server_tool_use": {
+                        "web_search_requests": search_count
+                    }
                 }
             }
         }),
@@ -396,7 +400,10 @@ fn generate_websearch_events(
                 "stop_sequence": null
             },
             "usage": {
-                "output_tokens": output_tokens
+                "output_tokens": output_tokens,
+                "server_tool_use": {
+                    "web_search_requests": search_count
+                }
             }
         }),
     ));
@@ -459,32 +466,111 @@ pub async fn handle_websearch_request(
         }
     };
 
-    tracing::info!(query = %query, "处理 WebSearch 请求");
+    tracing::debug!(query = %query, "处理 WebSearch 请求");
 
     // 2. 创建 MCP 请求
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
     // 3. 调用 Kiro MCP API
     let search_results = match call_mcp_api(&provider, &mcp_request).await {
-        Ok(response) => parse_search_results(&response),
+        Ok(response) => {
+            let results = parse_search_results(&response);
+            tracing::debug!(
+                has_results = results.is_some(),
+                result_count = results.as_ref().map(|r| r.results.len()).unwrap_or(0),
+                "MCP 搜索结果解析完成"
+            );
+            results
+        }
         Err(e) => {
             tracing::warn!("MCP API 调用失败: {}", e);
             None
         }
     };
 
-    // 4. 生成 SSE 响应
+    // 4. 根据 stream 参数返回不同格式的响应
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+    let search_count = search_results.as_ref().map(|r| if r.results.is_empty() { 0 } else { 1 }).unwrap_or(0);
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    if payload.stream {
+        // 流式 SSE 响应
+        let stream =
+            create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from_stream(stream))
+            .unwrap()
+    } else {
+        // 非流式 JSON 响应
+        let message_id = format!(
+            "msg_{}",
+            Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
+        );
+
+        // 构建搜索结果内容
+        let mut content: Vec<serde_json::Value> = Vec::new();
+
+        // server_tool_use 块
+        content.push(json!({
+            "type": "server_tool_use",
+            "id": tool_use_id,
+            "name": "web_search",
+            "input": { "query": query }
+        }));
+
+        // web_search_tool_result 块
+        let search_content: Vec<serde_json::Value> = if let Some(ref results) = search_results {
+            results.results.iter().map(|r| {
+                json!({
+                    "type": "web_search_result",
+                    "title": r.title,
+                    "url": r.url,
+                    "encrypted_content": r.snippet.clone().unwrap_or_default(),
+                    "page_age": null
+                })
+            }).collect()
+        } else {
+            vec![]
+        };
+
+        content.push(json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": tool_use_id,
+            "content": search_content
+        }));
+
+        // 文本摘要块
+        let summary = generate_search_summary(&query, &search_results);
+        content.push(json!({
+            "type": "text",
+            "text": summary
+        }));
+
+        let output_tokens = (summary.len() as i32 + 3) / 4;
+
+        let response_body = json!({
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "content": content,
+            "model": model,
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "server_tool_use": {
+                    "web_search_requests": search_count
+                }
+            }
+        });
+
+        (StatusCode::OK, Json(response_body)).into_response()
+    }
 }
 
 /// 调用 Kiro MCP API
@@ -582,8 +668,8 @@ mod tests {
             metadata: None,
         };
 
-        // 多个工具时不应该被识别为纯 websearch 请求
-        assert!(!has_web_search_tool(&req));
+        // 多个工具时，只要包含 web_search 就应该被识别
+        assert!(has_web_search_tool(&req));
     }
 
     #[test]
